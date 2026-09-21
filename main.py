@@ -1,8 +1,7 @@
-from fastapi import FastAPI
+"""本地运行入口：uvicorn main:app --reload。
 
-app = FastAPI()
+应用装配见 authapp.deps，路由见 authapp.api。
+"""
+from authapp.deps import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
