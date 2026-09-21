@@ -9,3 +9,18 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+log_cli = true
+log_cli_level = "WARNING"
+log_cli_format = "%(name)s: %(message)s"
+testpaths = ["tests"]
+
+[tool.uv]
+# 预留：如需要固定索引以外的包可在此扩展
