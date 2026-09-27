@@ -59,6 +59,60 @@
 因此多个触发并发发生时，由单一锁串行化，结果要么完全生效要么不生效，
 不会出现"只失效一部分会话"或"密码已改但旧会话仍可用"的半更新状态。
 
+### 自助会话管理（查看与定向收回）
+
+- 适用范围：仅限**已登录且完成多因素**的会话访问
+  （未 enrolled TOTP 的账号登录即视为已完成；待 MFA 确认的会话得到
+  `SESSION_CONFIRMATION_PENDING`）。两个端点都只针对本人账号：
+  - `GET /account/sessions`：只读，不强制 CSRF；
+  - `POST /account/sessions/{ref}/revoke`：状态变更，**强制登录态 + CSRF**。
+- **会话引用（ref）**：清单不返回原始会话标识，只返回
+  `HMAC-SHA256(密钥, "<username>:<session_id>")` 的十六进制摘要。
+  - 不可逆推原始标识，不随时间变化，重复查看同一活动会话引用恒定；
+  - 密钥来自 `session.reference_secret`（未配置时启动期随机生成，
+    因此重启后旧引用失效）；
+  - 输入绑定用户名：同一会话标识对不同账号的引用不同，引用跨账号提交
+    必然不命中。
+- **清单语义**：仅含未过期（空闲/绝对）、纪元与账号当前纪元一致的活动会话；
+  按 `(created_at, session_id)` 升序排列，同一时刻重复查看顺序与条数稳定；
+  每条包含 `created_at`、`last_seen`、`mfa_verified`、`ref` 与
+  `current`（标记当前会话）。不同账号之间完全隔离，无法通过清单观察他账号。
+- **定向收回**：只作废命中的那一条会话，同账号其余会话不受影响。
+  - 被收回标识立即失效并入墓碑（`cause="revoked"`），此后重放判
+    `SESSION_REPLAYED`，与从未签发过的标识（`UNAUTHENTICATED`）可区分；
+  - 引用未命中任何活动会话时，再在**本账号**墓碑中匹配：命中则返回
+    409 `SESSION_ALREADY_REVOKED`（含登出/轮换/过期/淘汰等各种已失效原因）；
+    完全不命中返回 404 `NOT_FOUND`。他账号的引用与随机伪造引用走同一
+    `NOT_FOUND` 路径，不能借此探测他账号会话是否存在；
+  - 收回操作记 `SESSION_REVOKED` 审计（`cause=targeted`），
+    审计中不出现引用/会话标识明文。
+
+### 每账号活动会话数上限
+
+- 配置 `session.max_active_sessions_per_account`（默认 16，正整数）。
+- 登录创建新会话后，在**同一个登录事务**内统计该账号未过期会话数；
+  超出上限时按 `(created_at, session_id)` 从最旧开始原子淘汰，直到不超限。
+  新登录会话始终保留（创建时刻相同的极端情况下显式跳过新会话）。
+- 被淘汰会话入墓碑（`cause="evicted"`）：从清单消失、重放判
+  `SESSION_REPLAYED`（区别于从未存在）、记 `SESSION_REVOKED` 审计
+  （`cause=capacity_eviction`）——列表、重放判定与审计上与逐条收回完全一致。
+- 并发登录由存储单锁串行化，任何时刻账号活动会话数都不超过上限；
+  并发的定向收回与淘汰不会交叉出半更新，收回若撞上先发生的淘汰，
+  得到稳定的 `SESSION_ALREADY_REVOKED`。
+
+### 与既有失效机制的兼容关系
+
+- 全设备登出 `/auth/logout-all`、改密、MFA 绑定/解绑、管理员 MFA 重置、
+  管理员变更角色：纪元 `+1` 并原子失效**全部**活动会话，优先级高于自助能力；
+  被这些机制作废的会话引用随即从清单消失，重放判 `SESSION_INVALIDATED`。
+- 显式轮换 `/auth/rotate`、单次登出 `/auth/logout`：旧标识入墓碑，
+  清单只保留新标识；对旧引用执行收回得到 `SESSION_ALREADY_REVOKED`。
+- 空闲/绝对过期：过期会话不出现在清单；其引用首次重放走惰性清理并判
+  `SESSION_EXPIRED`，之后判 `SESSION_REPLAYED`；对过期引用执行收回得到
+  `SESSION_ALREADY_REVOKED`。
+- 容量淘汰只影响"超出上限的最旧会话"，不改变纪元，因此同账号其余会话
+  （包括其余设备的登录态、CSRF 令牌）不受影响。
+
 ## 3. 多因素（TOTP，RFC 6238）
 
 - 共享密钥为随机 base32；同时返回 `otpauth://` URI 供认证器扫码。
@@ -104,8 +158,8 @@
 
 - 登录时随会话签发 256 位 CSRF 令牌；会话轮换 / MFA 升级时重新签发。
 - 令牌在服务端记录与会话、来源（Origin）绑定，并带独立 TTL。
-- 有状态变更的请求（登出、改密、轮换、MFA 绑定/解绑/重置、`write/admin`
-  资源动作）必须通过 CSRF 校验。`read` 动作不强制 CSRF。
+- 有状态变更的请求（登出、改密、轮换、MFA 绑定/解绑/重置、定向收回会话、
+  `write/admin` 资源动作）必须通过 CSRF 校验。`read` 动作不强制 CSRF。
 - JSON 入口用 `X-CSRF-Token` 头；表单入口可用同名头或 `csrf_token` 字段。
 - 可区分拒绝码：
 
@@ -158,7 +212,8 @@
 - 通道：标准 logging（logger `app.audit`，WARNING 级别 JSON 行）
   以及内存缓冲（测试可读取断言）。
 - 覆盖事件：注册、登录成功/失败/锁定、登出、会话过期/重放、
-  访问允许/拒绝、CSRF 拒绝、MFA 绑定/校验/解绑/重置、改密、基础设施异常。
+  定向收回/容量淘汰、访问允许/拒绝、CSRF 拒绝、
+  MFA 绑定/校验/解绑/重置、改密、基础设施异常。
 - 脱敏：键名包含 `password / secret / totp / otp / code / session_id /
   sid / csrf / token` 等片段的字段一律输出 `<redacted>`；
   审计中不会出现口令、一次性验证码、会话/CSRF 令牌明文。

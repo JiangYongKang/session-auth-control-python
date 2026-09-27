@@ -33,6 +33,7 @@ class Store:
     def delete_session(self, session_id: str, *,
                        cause: str = "logout") -> None: ...
     def list_user_sessions(self, username: str) -> list[SessionRecord]: ...
+    def list_user_tombstone_ids(self, username: str) -> list[str]: ...
     def is_tombstoned(self, session_id: str, now: float) -> bool: ...
     def tombstone_info(self, session_id: str) -> dict | None: ...
     def rotate_session(self, old_id: str, new: SessionRecord,
@@ -110,6 +111,12 @@ class InMemoryStore(Store):
         with self._lock:
             return [_copy_session(s) for s in self._sessions.values()
                     if s.username == username]
+
+    def list_user_tombstone_ids(self, username: str) -> list[str]:
+        """该用户已撤销（入墓碑）的会话标识，用于"已失效引用"的可区分判定。"""
+        with self._lock:
+            return [sid for sid, t in self._tombstones.items()
+                    if t.get("username") == username]
 
     def is_tombstoned(self, session_id: str, now: float) -> bool:
         with self._lock:

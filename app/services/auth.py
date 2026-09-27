@@ -209,6 +209,7 @@ class AuthService:
             self.store.put_user(user)
 
             sid, csrf = self._create_session_locked(user, now, origin)
+            self._enforce_capacity_locked(user.username, now, keep_sid=sid)
 
         mfa_required = bool(user.totp_enrolled and user.totp_secret)
         self.audit.record(
@@ -411,6 +412,37 @@ class AuthService:
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+    def _enforce_capacity_locked(self, username: str, now: float,
+                                 *, keep_sid: str) -> None:
+        """每账号活动会话数上限：超限则原子淘汰最旧会话。
+
+        调用方已持登录事务（单锁），与定向收回/全量失效串行化，
+        不会出现只淘汰一部分的半更新；新登录会话始终保留。
+        被淘汰会话与逐条收回一样入墓碑（cause="evicted"），
+        重放判定、审计事件均与定向收回一致。
+        """
+        limit = self.config.session.max_active_sessions_per_account
+        active = [
+            s for s in self.store.list_user_sessions(username)
+            if now < s.absolute_expiry and now < s.idle_expiry
+        ]
+        excess = len(active) - limit
+        if excess <= 0:
+            return
+        active.sort(key=lambda s: (s.created_at, s.session_id))
+        evicted: list[str] = []
+        for sess in active:
+            if len(evicted) >= excess:
+                break
+            if sess.session_id == keep_sid:
+                continue  # 新登录会话始终保留（同刻创建时跳过它）
+            self.store.delete_session(sess.session_id, cause="evicted")
+            evicted.append(sess.session_id)
+        for sid in evicted:
+            self.audit.record(
+                AuditEvent.SESSION_REVOKED, user=username, result="ok",
+                reason=None, cause="capacity_eviction")
+
     def _create_session_locked(self, user: UserRecord, now: float,
                                origin: str) -> tuple[str, str]:
         sid = new_session_id()

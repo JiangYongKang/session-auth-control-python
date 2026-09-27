@@ -42,8 +42,20 @@
 | `idle_timeout_seconds` | 1800 | 空闲超时（滑动） |
 | `absolute_timeout_seconds` | 28800 | 绝对超时（上限） |
 | `csrf_ttl_seconds` | 1800 | CSRF 令牌有效期 |
+| `max_active_sessions_per_account` | 16 | 每账号同时活动会话数上限 |
+| `reference_secret` | null | 会话引用 HMAC 密钥（见下） |
 
-要求 `idle <= absolute`，均为正整数。
+要求 `idle <= absolute`，时长均为正整数；上限为正整数。
+达到上限后再登录会在登录事务内原子淘汰最旧的活动会话，新登录始终保留。
+
+`reference_secret` 用于计算 `GET /account/sessions` 返回的会话引用
+（`HMAC-SHA256(secret, "<username>:<session_id>")`）：
+
+- 为 `null`（默认）时启动期随机生成，进程内引用稳定，**重启后旧引用失效**
+  （对客户端表现为 `NOT_FOUND`）；
+- 显式配置时必须是长度 >= 16 的字符串，可跨重启保持引用稳定；
+  该值属机密，泄漏后他人可离线枚举伪造引用（仍需有效登录态 + CSRF 才能
+  发起收回，且收回范围仍限本人账号）。
 
 ### `role_permissions`（角色权限矩阵）
 
@@ -90,7 +102,8 @@ cfg = default_config({
     "totp": {"drift_steps": 0},
     "session": {"idle_timeout_seconds": 10,
                 "absolute_timeout_seconds": 100,
-                "csrf_ttl_seconds": 5},
+                "csrf_ttl_seconds": 5,
+                "max_active_sessions_per_account": 2},
 })
 app = create_app(config=cfg)
 ```

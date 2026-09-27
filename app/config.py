@@ -38,6 +38,10 @@ class SessionConfig:
     idle_timeout_seconds: int = 1800       # 无操作过期
     absolute_timeout_seconds: int = 28800  # 绝对过期
     csrf_ttl_seconds: int = 1800
+    # 每账号同时活动会话数上限；达到上限后新登录原子淘汰最旧会话
+    max_active_sessions_per_account: int = 16
+    # 会话引用 HMAC 密钥；None 表示启动期随机生成（重启后引用失效）
+    reference_secret: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,13 @@ def load_config(overrides: dict | None = None) -> SecurityConfig:
         _check_positive("session.csrf_ttl_seconds", sess.csrf_ttl_seconds)
         if sess.idle_timeout_seconds > sess.absolute_timeout_seconds:
             raise ConfigError("idle timeout cannot exceed absolute timeout")
+        _check_positive("session.max_active_sessions_per_account",
+                        sess.max_active_sessions_per_account)
+        if sess.reference_secret is not None and (
+                not isinstance(sess.reference_secret, str)
+                or len(sess.reference_secret) < 16):
+            raise ConfigError(
+                "session.reference_secret must be a string of >= 16 chars")
 
         role_permissions = _validate_role_permissions(
             overrides.get("role_permissions"))

@@ -51,6 +51,10 @@ class FailingStore(Store):
         self._maybe_fail("list_user_sessions")
         return self._inner.list_user_sessions(username)
 
+    def list_user_tombstone_ids(self, username: str) -> list[str]:
+        self._maybe_fail("list_user_tombstone_ids")
+        return self._inner.list_user_tombstone_ids(username)
+
     def is_tombstoned(self, session_id: str, now: float) -> bool:
         self._maybe_fail("is_tombstoned")
         return self._inner.is_tombstoned(session_id, now)

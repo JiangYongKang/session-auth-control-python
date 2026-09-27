@@ -33,6 +33,7 @@ app.audit: AUDIT {"event": "CSRF_REJECTED", "fields": {"origin": "http://evil.ex
 | `tests/test_access_control.py` | 默认拒绝、越权、前缀边界、不信客户端角色、MFA 待确认拦截 |
 | `tests/test_mfa.py` | 绑定前置条件、错误/重放/时间漂移区分、解绑、管理员重置 |
 | `tests/test_session_invalidation.py` | 改密/全量登出立即一致失效、并发无半更新 |
+| `tests/test_session_management.py` | 清单稳定/隔离/引用不可反推、定向收回只影响目标、已失效与未知引用区分、跨账号拒绝、串行与并发容量淘汰 |
 | `tests/test_infra_failures.py` | 存储/时间源/未知异常 fail-closed、错误归一化 |
 | `tests/test_audit.py` | 审计事件覆盖与口令/验证码/会话标识脱敏 |
 
@@ -122,11 +123,38 @@ from app.security.totp import generate_code, current_step
 code = generate_code(secret, current_step(now, period=30))
 ```
 
-## 6. 错误判定码速查
+## 6. 自助会话管理手工流程
+
+以下请求沿用第 4 节的 `$SID` / `$CSRF`（已登录 alice）。
+
+```bash
+# 查看本人活动会话（只读，无需 CSRF）
+curl -s $BASE/account/sessions -H "X-Session-Id: $SID" -H 'Origin: http://local.test'
+# => {"sessions":[{"ref":"…64hex…","created_at":...,"last_seen":...,
+#                  "mfa_verified":true,"current":true}]}
+
+# 用引用定向收回其中一条（状态变更，必须带 CSRF）
+REF=$(curl -s $BASE/account/sessions -H "X-Session-Id: $SID" \
+  -H 'Origin: http://local.test' | python3 -c "import sys,json;print(json.load(sys.stdin)['sessions'][0]['ref'])")
+curl -s -X POST $BASE/account/sessions/$REF/revoke \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $CSRF" -H 'Origin: http://local.test'
+# => {"status":"revoked"}
+# 再次收回同一引用 => 409 SESSION_ALREADY_REVOKED
+# 随机/他账号引用      => 404 NOT_FOUND（两者同形）
+# 收回后重放该标识    => 401 SESSION_REPLAYED（区别于从未存在的 UNAUTHENTICATED）
+```
+
+容量上限：用 `session.max_active_sessions_per_account` 覆盖配置启动
+（或直接运行 `uv run pytest tests/test_session_management.py -q`），
+连续登录超过上限后，清单条数恒等于上限，最早登录的会话重放得到
+`SESSION_REPLAYED`，最新会话始终可用。
+
+## 7. 错误判定码速查
 
 - 认证：`INVALID_CREDENTIALS`、`ACCOUNT_LOCKED`
 - 会话：`UNAUTHENTICATED`、`SESSION_EXPIRED`、`SESSION_REPLAYED`、
-  `SESSION_INVALIDATED`、`SESSION_CONFIRMATION_PENDING`
+  `SESSION_INVALIDATED`、`SESSION_CONFIRMATION_PENDING`、
+  `SESSION_ALREADY_REVOKED`、`NOT_FOUND`（会话引用不存在，404）
 - MFA：`MFA_CODE_INVALID`、`MFA_CODE_REUSED`、`MFA_TIME_DRIFT`、
   `MFA_NOT_ENROLLED`、`MFA_ALREADY_ENROLLED`
 - 授权 / CSRF：`FORBIDDEN`、`CSRF_MISSING/INVALID/EXPIRED/BOUND_SESSION/BOUND_ORIGIN`
