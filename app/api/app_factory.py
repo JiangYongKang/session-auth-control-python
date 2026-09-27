@@ -20,6 +20,8 @@ from app.errors import AppError, ErrorCode, normalize
 from app.services.access import AccessService
 from app.services.auth import AuthService
 from app.services.mfa import MfaService
+from app.services.sessions import SessionsService
+from app.security.session_ref import SessionReferenceSigner
 from app.storage.faults import FailingStore
 from app.storage.store import InMemoryStore, Store
 from app.time_source import SystemTimeSource, TimeSource
@@ -37,6 +39,9 @@ class ServiceContainer:
         self.auth = AuthService(store, time, config, audit)
         self.mfa = MfaService(store, time, config, audit, self.auth)
         self.access = AccessService(config, audit)
+        self.sessions = SessionsService(
+            store, time, config, audit, SessionReferenceSigner())
+        self.sessions.auth = self.auth
 
 
 def create_app(store: Store | None = None, *,
@@ -110,7 +115,9 @@ def create_app(store: Store | None = None, *,
     from app.api.routes_auth import router as auth_router
     from app.api.routes_mfa import router as mfa_router
     from app.api.routes_resources import router as res_router
+    from app.api.routes_sessions import router as sessions_router
     app.include_router(auth_router)
     app.include_router(mfa_router)
     app.include_router(res_router)
+    app.include_router(sessions_router)
     return app

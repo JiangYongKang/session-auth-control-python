@@ -59,14 +59,20 @@ class FailingStore(Store):
         self._maybe_fail("tombstone_info")
         return self._inner.tombstone_info(session_id)
 
+    def list_user_tombstone_ids(self, username: str) -> list[str]:
+        self._maybe_fail("list_user_tombstone_ids")
+        return self._inner.list_user_tombstone_ids(username)
+
     def rotate_session(self, old_id: str, new: SessionRecord,
                        now: float) -> None:
         self._maybe_fail("rotate_session")
         self._inner.rotate_session(old_id, new, now)
 
-    def invalidate_user_sessions(self, username: str, now: float) -> int:
+    def invalidate_user_sessions(self, username: str, now: float,
+                                 *, cause: str = "invalidated") -> int:
         self._maybe_fail("invalidate_user_sessions")
-        return self._inner.invalidate_user_sessions(username, now)
+        return self._inner.invalidate_user_sessions(
+            username, now, cause=cause)
 
     def get_csrf(self, token: str) -> CsrfTokenRecord | None:
         self._maybe_fail("get_csrf")

@@ -76,20 +76,24 @@ def test_concurrent_failures_lock_once(api, store, audit, config):
 def test_concurrent_failures_never_bypass_to_success(api, store):
     api.register("bob")
 
-    def one(args):
-        pw = args
+    def one(_):
         r = api.c.post("/auth/login",
-                       json={"username": "bob", "password": pw},
+                       json={"username": "bob", "password": "wrongpass1"},
                        headers={"Origin": "http://testserver"})
         return r.status_code
 
+    # 并发全部为错误口令：成功登录本就会清零失败计数（合法语义），
+    # 因此不在同一批里混合正确口令，避免"成功先到则不锁"的非确定结果。
     with cf.ThreadPoolExecutor(10) as ex:
-        codes = list(ex.map(one, ["wrongpass1"] * 5 + ["Sup3rSecret"] * 5))
-    # 任何 200 都是绕过；先到的正确口令最多产生一次 200（在失败计数前），
-    # 但混合并发下若失败先到则全部 4xx。关键：锁定一旦设置，后续必 423。
+        codes = list(ex.map(one, range(10)))
+    # 没有任何一次错误登录能绕过成 200
+    assert all(code in (401, 423) for code in codes), codes
+    # 阈值 3：并发失败后账号必然已锁，随后即使口令正确也稳定 423
     later = api.login("bob", "Sup3rSecret")
-    # 五错 + 若干对：阈值 3，必然已锁
     assert later.status_code == 423
+    # 不超计：失败计数恰好停在阈值
+    limit = api.c.app.state.services.config.throttle.max_failures
+    assert store.get_user("bob").fail_count == limit
 
 
 def test_thresholds_configurable(store, time_source, audit):

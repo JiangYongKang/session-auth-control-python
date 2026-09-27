@@ -42,8 +42,24 @@
 | `idle_timeout_seconds` | 1800 | 空闲超时（滑动） |
 | `absolute_timeout_seconds` | 28800 | 绝对超时（上限） |
 | `csrf_ttl_seconds` | 1800 | CSRF 令牌有效期 |
+| `max_sessions_per_account` | 10 | 每账号活动会话数上限（正整数） |
 
-要求 `idle <= absolute`，均为正整数。
+要求 `idle <= absolute`，均为正整数；`max_sessions_per_account` 必须为
+正整数（`1` 表示仅保留最近一次登录的会话）。达到上限再登录时，在同一存储
+事务内先清扫过期会话、再按"最旧优先"原子淘汰，新登录会话始终保留，
+任何时刻活动会话数都不超过该值。
+
+### 会话稳定引用的密钥
+
+会话清单中的 `reference` 是 `(账号, 会话标识)` 在服务端密钥下的 HMAC-SHA256。
+该密钥由 `SessionReferenceSigner` 在进程启动时随机生成（`secrets.token_bytes(32)`），
+因此：
+
+- 不落盘、不随任何接口输出，引用不可反推原始标识；
+- 引用仅在**同一进程生命周期内**可解析。进程重启后旧引用不再能解析，
+  会话本身仍按原有效期/墓碑语义正常工作，用户重新查看清单即可获得新引用。
+- 需要跨进程/多副本共享时，应通过受控配置向 `SessionReferenceSigner(secret=...)`
+  注入统一密钥（当前内存存储本身也是单进程的，多副本部署需先替换存储实现）。
 
 ### `role_permissions`（角色权限矩阵）
 
@@ -90,7 +106,8 @@ cfg = default_config({
     "totp": {"drift_steps": 0},
     "session": {"idle_timeout_seconds": 10,
                 "absolute_timeout_seconds": 100,
-                "csrf_ttl_seconds": 5},
+                "csrf_ttl_seconds": 5,
+                "max_sessions_per_account": 3},
 })
 app = create_app(config=cfg)
 ```

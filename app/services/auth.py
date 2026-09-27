@@ -15,7 +15,7 @@ from typing import Any
 
 from app.audit import AuditEvent, AuditLogger
 from app.config import SecurityConfig
-from app.errors import AppError, ErrorCode, TimeSourceError
+from app.errors import AppError, ErrorCode, StoreError, TimeSourceError
 from app.security.csrf import issue_csrf_token
 from app.security.passwords import hash_password, validate_password, verify_password
 from app.storage.models import CsrfTokenRecord, SessionRecord, UserRecord
@@ -209,6 +209,15 @@ class AuthService:
             self.store.put_user(user)
 
             sid, csrf = self._create_session_locked(user, now, origin)
+            evicted = self._enforce_capacity_locked(
+                user.username, now, keep_session_id=sid)
+
+        for ev in evicted:
+            # 容量淘汰与逐条收回在审计上同构：每条一条 SESSION_REVOKED
+            self.audit.record(
+                AuditEvent.SESSION_REVOKED, user=user.username, result="ok",
+                reason="capacity_evicted", cause="capacity_evicted",
+                session_age_s=max(0, int(now - ev.created_at)))
 
         mfa_required = bool(user.totp_enrolled and user.totp_secret)
         self.audit.record(
@@ -398,6 +407,14 @@ class AuthService:
                                "session invalidated by account change")
             new_id = new_session_id()
             csrf = issue_csrf_token()
+            # 旧 CSRF 与旧标识一并退役；新令牌必须服务端落库，
+            # 否则旋转后的会话无法通过任何状态变更的 CSRF 校验。
+            origin = "unknown"
+            if old.csrf_token:
+                prev_csrf = self.store.get_csrf(old.csrf_token)
+                if prev_csrf is not None:
+                    origin = prev_csrf.origin
+                    self.store.delete_csrf(old.csrf_token)
             new = SessionRecord(
                 session_id=new_id, username=old.username,
                 created_at=old.created_at, last_seen=now,
@@ -406,11 +423,58 @@ class AuthService:
                 mfa_verified=old.mfa_verified, epoch=old.epoch,
                 csrf_token=csrf)
             self.store.rotate_session(old_session_id, new, now)
+            self.store.put_csrf(CsrfTokenRecord(
+                token=csrf, session_id=new_id, username=old.username,
+                origin=origin,
+                expires_at=now + self.config.session.csrf_ttl_seconds))
         return new_id, csrf
 
     # ------------------------------------------------------------------ #
     # 辅助
     # ------------------------------------------------------------------ #
+    def sweep_expired_user_sessions(self, username: str,
+                                    now: float) -> list[SessionRecord]:
+        """在调用方已持事务的前提下，原子清扫该用户已过期的活动会话。
+
+        过期会话入墓碑（cause=expired），不再计入容量；返回被清扫记录副本。
+        """
+        swept: list[SessionRecord] = []
+        for s in self.store.list_user_sessions(username):
+            if now >= s.absolute_expiry or now >= s.idle_expiry:
+                self.store.delete_session(s.session_id, cause="expired")
+                swept.append(s)
+        return swept
+
+    def _enforce_capacity_locked(self, username: str, now: float, *,
+                                 keep_session_id: str
+                                 ) -> list[SessionRecord]:
+        """每账号活动会话数上限（调用方已持事务）。
+
+        1) 先清扫过期会话（它们不应占据名额）；
+        2) 剩余活动会话超过上限时，按 (创建时间, 标识) 淘汰最旧的若干条；
+        3) keep_session_id（本次新登录会话）永不被淘汰——新登录始终保留。
+        整个过程与新会话创建处于同一把锁/同一事务，淘汰与插入原子，
+        任何时刻该账号活动会话数都不会超过上限。
+        """
+        self.sweep_expired_user_sessions(username, now)
+        limit = self.config.session.max_sessions_per_account
+        active = self.store.list_user_sessions(username)
+        keep = [s for s in active if s.session_id == keep_session_id]
+        others = sorted(
+            (s for s in active if s.session_id != keep_session_id),
+            key=lambda s: (s.created_at, s.session_id))
+        excess = len(active) - limit
+        if excess <= 0:
+            return []
+        victims = others[:excess]
+        for v in victims:
+            # 与逐条收回同构：入墓碑，重放判定为 SESSION_REPLAYED
+            self.store.delete_session(v.session_id, cause="capacity_evicted")
+        # 防御性自检：新会话必须在场
+        if not keep:  # pragma: no cover - 逻辑不变量
+            raise StoreError("capacity enforcement lost the new session")
+        return victims
+
     def _create_session_locked(self, user: UserRecord, now: float,
                                origin: str) -> tuple[str, str]:
         sid = new_session_id()

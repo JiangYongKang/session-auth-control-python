@@ -38,6 +38,8 @@ class SessionConfig:
     idle_timeout_seconds: int = 1800       # 无操作过期
     absolute_timeout_seconds: int = 28800  # 绝对过期
     csrf_ttl_seconds: int = 1800
+    # 每账号活动会话数上限：达到上限再登录时原子淘汰最旧会话
+    max_sessions_per_account: int = 10
 
 
 @dataclass(frozen=True)
@@ -73,7 +75,8 @@ def load_config(overrides: dict | None = None) -> SecurityConfig:
       throttle/max_failures, throttle/window_seconds, throttle/lock_seconds,
       totp/period, totp/digits, totp/drift_steps, totp/issuer,
       session/idle_timeout_seconds, session/absolute_timeout_seconds,
-      session/csrf_ttl_seconds, role_permissions
+      session/csrf_ttl_seconds, session/max_sessions_per_account,
+      role_permissions
     """
     overrides = dict(overrides or {})
     try:
@@ -114,6 +117,8 @@ def load_config(overrides: dict | None = None) -> SecurityConfig:
         _check_positive("session.absolute_timeout_seconds",
                         sess.absolute_timeout_seconds)
         _check_positive("session.csrf_ttl_seconds", sess.csrf_ttl_seconds)
+        _check_positive("session.max_sessions_per_account",
+                        sess.max_sessions_per_account)
         if sess.idle_timeout_seconds > sess.absolute_timeout_seconds:
             raise ConfigError("idle timeout cannot exceed absolute timeout")
 

@@ -62,4 +62,33 @@ curl -s -X POST "$BASE/auth/logout" \
 curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
   -H "X-Session-Id: $SID" -d '{"resource":"docs/a","action":"read"}'; echo
 
+echo "== 自助会话管理：清单 / 定向收回 / 引用判定 =="
+# viewer 重新登录两次，制造两条活动会话
+V1=$(curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -H 'Origin: http://local.test' \
+  -d '{"username":"viewer","password":"Sup3rSecret"}')
+S1=$(echo "$V1" | j "['session_id']"); C1=$(echo "$V1" | j "['csrf_token']")
+curl -s -X POST "$BASE/auth/login" -H 'Content-Type: application/json' \
+  -H 'Origin: http://local.test' \
+  -d '{"username":"viewer","password":"Sup3rSecret"}' >/dev/null
+echo "-- 活动会话清单（按创建时间稳定排序，引用为 64 hex）--"
+curl -s "$BASE/account/sessions" -H "X-Session-Id: $S1" | python3 -m json.tool
+REF=$(curl -s "$BASE/account/sessions" -H "X-Session-Id: $S1" | \
+  python3 -c "import sys,json;print(next(s['reference'] for s in json.load(sys.stdin)['sessions'] if not s['current']))")
+echo "-- 定向收回非当前会话 => status=revoked --"
+curl -s -X POST "$BASE/account/sessions/revoke" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $S1" -H "X-CSRF-Token: $C1" -H 'Origin: http://local.test' \
+  -d "{\"reference\":\"$REF\"}"; echo
+echo "-- 同一引用再收回 => 410 SESSION_REFERENCE_REVOKED --"
+curl -s -X POST "$BASE/account/sessions/revoke" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $S1" -H "X-CSRF-Token: $C1" -H 'Origin: http://local.test' \
+  -d "{\"reference\":\"$REF\"}"; echo
+echo "-- 伪造引用 => 404 SESSION_REFERENCE_UNKNOWN；缺 CSRF => CSRF_MISSING --"
+curl -s -X POST "$BASE/account/sessions/revoke" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $S1" -H "X-CSRF-Token: $C1" -H 'Origin: http://local.test' \
+  -d "{\"reference\":\"$(python3 -c 'print("0"*64)')\"}"; echo
+curl -s -X POST "$BASE/account/sessions/revoke" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $S1" -H 'Origin: http://local.test' \
+  -d "{\"reference\":\"$REF\"}"; echo
+
 echo "E2E_DONE"

@@ -33,6 +33,7 @@ app.audit: AUDIT {"event": "CSRF_REJECTED", "fields": {"origin": "http://evil.ex
 | `tests/test_access_control.py` | 默认拒绝、越权、前缀边界、不信客户端角色、MFA 待确认拦截 |
 | `tests/test_mfa.py` | 绑定前置条件、错误/重放/时间漂移区分、解绑、管理员重置 |
 | `tests/test_session_invalidation.py` | 改密/全量登出立即一致失效、并发无半更新 |
+| `tests/test_session_management.py` | 活动会话清单、稳定引用、定向收回、跨账号/失效引用拒绝、容量上限与并发登录淘汰 |
 | `tests/test_infra_failures.py` | 存储/时间源/未知异常 fail-closed、错误归一化 |
 | `tests/test_audit.py` | 审计事件覆盖与口令/验证码/会话标识脱敏 |
 
@@ -41,6 +42,11 @@ app.audit: AUDIT {"event": "CSRF_REJECTED", "fields": {"origin": "http://evil.ex
 ```bash
 uv run pytest tests/test_throttle.py -q
 uv run pytest -q -k "replay or csrf or throttle or mfa"
+# 新能力（清单 / 定向收回 / 容量上限 / 并发）
+uv run pytest tests/test_session_management.py -q
+uv run pytest -q -k "revoke or capacity or reference"
+# 连续多轮确认稳定性（新测试含并发登录/收回场景）
+for i in 1 2 3; do uv run pytest -q || break; done
 ```
 
 ## 2. 启动真实服务
@@ -122,11 +128,56 @@ from app.security.totp import generate_code, current_step
 code = generate_code(secret, current_step(now, period=30))
 ```
 
-## 6. 错误判定码速查
+## 6. 自助会话管理与容量上限手工流程
+
+以下假设已用 `alice / Sup3rSecret` 登录（未绑定 MFA 时登录即视为已完成
+多因素），`SID` / `CSRF` 为最近一次登录返回值。
+
+```bash
+# 多登录几次制造多条活动会话
+curl -s -X POST $BASE/auth/login -H 'Content-Type: application/json' \
+  -H 'Origin: http://local.test' \
+  -d '{"username":"alice","password":"Sup3rSecret"}' >/dev/null
+
+# 查看本人活动会话（只读，GET 无需 CSRF；需登录 + MFA）
+curl -s $BASE/account/sessions -H "X-Session-Id: $SID" | python3 -m json.tool
+# => {"sessions":[{"reference":"<64hex>","created_at":...,"last_seen_at":...,
+#                  "mfa_verified":true,"current":...}], "count":N}
+
+# 取出非当前会话的引用，定向收回它（状态变更：需 CSRF + 同源）
+REF=$(curl -s $BASE/account/sessions -H "X-Session-Id: $SID" \
+  | python3 -c "import sys,json;print(next(s['reference'] for s in json.load(sys.stdin)['sessions'] if not s['current']))")
+curl -s -X POST $BASE/account/sessions/revoke -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $CSRF" -H 'Origin: http://local.test' \
+  -d "{\"reference\":\"$REF\"}"
+# => {"status":"revoked"}
+
+# 再次收回同一引用 => 410 SESSION_REFERENCE_REVOKED
+# 用其他账号的引用 / 64 位伪造值 => 404 SESSION_REFERENCE_UNKNOWN
+# 不带 CSRF => 403 CSRF_MISSING
+```
+
+验证容量上限（测试/本地可临时调小上限）：
+
+```python
+from app.api.app_factory import create_app
+from app.config import default_config
+cfg = default_config({"session": {"max_sessions_per_account": 3}})
+app = create_app(config=cfg)   # 同一账号第 4 次登录将原子淘汰最旧会话
+```
+
+并发登录/收回的原子性由内存存储的单一 `RLock` 保证，
+见 `tests/test_session_management.py` 中的
+`test_concurrent_logins_never_exceed_capacity` 与
+`test_concurrent_revoke_and_eviction_leave_consistent_state`。
+
+## 7. 错误判定码速查
 
 - 认证：`INVALID_CREDENTIALS`、`ACCOUNT_LOCKED`
 - 会话：`UNAUTHENTICATED`、`SESSION_EXPIRED`、`SESSION_REPLAYED`、
   `SESSION_INVALIDATED`、`SESSION_CONFIRMATION_PENDING`
+- 会话引用：`SESSION_REFERENCE_REVOKED`（410，曾有效已撤销）、
+  `SESSION_REFERENCE_UNKNOWN`（404，对该账号不存在/属他人/伪造）
 - MFA：`MFA_CODE_INVALID`、`MFA_CODE_REUSED`、`MFA_TIME_DRIFT`、
   `MFA_NOT_ENROLLED`、`MFA_ALREADY_ENROLLED`
 - 授权 / CSRF：`FORBIDDEN`、`CSRF_MISSING/INVALID/EXPIRED/BOUND_SESSION/BOUND_ORIGIN`

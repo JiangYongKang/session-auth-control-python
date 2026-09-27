@@ -35,10 +35,11 @@ class Store:
     def list_user_sessions(self, username: str) -> list[SessionRecord]: ...
     def is_tombstoned(self, session_id: str, now: float) -> bool: ...
     def tombstone_info(self, session_id: str) -> dict | None: ...
+    def list_user_tombstone_ids(self, username: str) -> list[str]: ...
     def rotate_session(self, old_id: str, new: SessionRecord,
                        now: float) -> None: ...
-    def invalidate_user_sessions(self, username: str,
-                                 now: float) -> int: ...
+    def invalidate_user_sessions(self, username: str, now: float,
+                                 *, cause: str = "invalidated") -> int: ...
 
     # --- CSRF ---
     def get_csrf(self, token: str) -> CsrfTokenRecord | None: ...
@@ -110,6 +111,16 @@ class InMemoryStore(Store):
         with self._lock:
             return [_copy_session(s) for s in self._sessions.values()
                     if s.username == username]
+
+    def list_user_tombstone_ids(self, username: str) -> list[str]:
+        """该账号已撤销会话标识（墓碑），用于把"已收回"与"从未存在"区分。
+
+        只返回属于该账号的条目；其他账号的墓碑对调用方不可见，
+        从而无法借引用解析探测他人会话。
+        """
+        with self._lock:
+            return [sid for sid, t in self._tombstones.items()
+                    if t.get("username") == username]
 
     def is_tombstoned(self, session_id: str, now: float) -> bool:
         with self._lock:

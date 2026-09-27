@@ -109,3 +109,23 @@ def test_logout_all_endpoint_invalidates_every_session(api):
                         headers={"X-Session-Id": sid})
         assert rr.json()["reason"] in ("SESSION_REPLAYED",
                                        "SESSION_INVALIDATED")
+
+
+def test_rotated_session_csrf_works_for_state_change(api):
+    """旋转后签发的新 CSRF 必须已服务端落库（旧实现的遗漏）。"""
+    api.register("alice", roles=["editor"])
+    api.login("alice")
+    r = api.post("/auth/rotate")
+    assert r.status_code == 200, r.text
+    new_sid = r.json()["session_id"]
+    new_csrf = r.json()["csrf_token"]
+    api.adopt(new_sid, new_csrf)
+    # 状态变更端点：新会话 + 新 CSRF 必须通过（editor 有 write 权限）
+    r2 = api.post("/access/resource",
+                  json_body={"resource": "docs/x", "action": "write"})
+    assert r2.status_code == 200, r2.text
+    # 旧 CSRF 不得继续有效
+    r3 = api.post("/access/resource",
+                  json_body={"resource": "docs/x", "action": "write"},
+                  raw_csrf="deadbeef", with_csrf=False)
+    assert r3.status_code == 403
