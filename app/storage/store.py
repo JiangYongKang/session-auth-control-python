@@ -6,6 +6,10 @@
 被轮换、登出或批量失效的会话标识写入"墓碑"，
 以便把"重放旧标识"与"标识从未存在"区分判定；
 墓碑保留至该会话本应绝对过期的时刻。
+
+随会话一起被撤销（轮换/登出/失效）的 CSRF 令牌同样写入 CSRF 墓碑，
+与"从未签发的伪造令牌"区分；会话标识的换入/换出与 CSRF 令牌的
+换入/换出在同一把锁内完成，任何时刻都不存在半更新。
 """
 from __future__ import annotations
 
@@ -37,7 +41,8 @@ class Store:
     def is_tombstoned(self, session_id: str, now: float) -> bool: ...
     def tombstone_info(self, session_id: str) -> dict | None: ...
     def rotate_session(self, old_id: str, new: SessionRecord,
-                       now: float) -> None: ...
+                       now: float, *,
+                       new_csrf: CsrfTokenRecord | None = None) -> None: ...
     def invalidate_user_sessions(self, username: str,
                                  now: float) -> int: ...
 
@@ -45,6 +50,7 @@ class Store:
     def get_csrf(self, token: str) -> CsrfTokenRecord | None: ...
     def put_csrf(self, token: CsrfTokenRecord) -> None: ...
     def delete_csrf(self, token: str) -> None: ...
+    def csrf_tombstone_info(self, token: str) -> dict | None: ...
 
 
 class InMemoryStore(Store):
@@ -56,6 +62,10 @@ class InMemoryStore(Store):
         # sid -> {"keep_until": float, "username": str, "cause": str}
         self._tombstones: dict[str, dict] = {}
         self._csrfs: dict[str, CsrfTokenRecord] = {}
+        # csrf token -> {"session_id": str, "username": str, "cause": str}
+        # 已撤销令牌的墓碑：语义为"该令牌曾签发且已撤销"，
+        # 必须能与"从未签发的令牌"稳定区分；进程生命周期内保留。
+        self._csrf_tombstones: dict[str, dict] = {}
         self._lock = threading.RLock()
 
     @contextmanager
@@ -99,6 +109,30 @@ class InMemoryStore(Store):
             else (prev.get("epoch") if prev else None),
         }
 
+    def _retire_csrf_locked(self, token: str | None, username: str,
+                            cause: str, session_id: str = "") -> None:
+        """把活动 CSRF 令牌原子地撤入墓碑。调用方必须已持锁。
+
+        与旧会话标识同事务处理，保证不会出现"标识已换但旧令牌仍可用"
+        或"新令牌已发但不可用"的半更新。墓碑进程内保留，
+        使"曾签发但已撤销"可与"从未签发（伪造）"区分。
+        """
+        if not token:
+            return
+        record = self._csrfs.pop(token, None)
+        if record is None and token not in self._csrf_tombstones:
+            return
+        prev = self._csrf_tombstones.get(token)
+        self._csrf_tombstones[token] = {
+            "session_id": session_id
+            or (record.session_id if record is not None else "")
+            or (prev["session_id"] if prev else ""),
+            "username": username
+            or (record.username if record is not None else "")
+            or (prev["username"] if prev else ""),
+            "cause": (prev["cause"] if prev else cause),
+        }
+
     def delete_session(self, session_id: str, *,
                        cause: str = "logout") -> None:
         with self._lock:
@@ -106,6 +140,8 @@ class InMemoryStore(Store):
             if s is not None:
                 self._tombstone_locked(session_id, s.absolute_expiry,
                                        s.username, cause, s.epoch)
+                self._retire_csrf_locked(s.csrf_token, s.username, cause,
+                                         session_id=session_id)
 
     def list_user_sessions(self, username: str) -> list[SessionRecord]:
         with self._lock:
@@ -128,19 +164,30 @@ class InMemoryStore(Store):
             return None if t is None else dict(t)
 
     def rotate_session(self, old_id: str, new: SessionRecord,
-                       now: float) -> None:
-        """原子轮换：旧的必须存在 -> 旧的入墓碑，新的生效。"""
+                       now: float, *,
+                       new_csrf: CsrfTokenRecord | None = None) -> None:
+        """原子轮换：旧的必须存在 -> 旧的与旧 CSRF 同事务入墓碑，
+        新会话生效、新 CSRF 同事务落库。要么整步完成，要么完全不变。"""
         with self._lock:
             old = self._sessions.get(old_id)
             if old is None:
                 if old_id in self._tombstones:
                     raise StoreError("cannot rotate tombstoned session")
                 raise StoreError("cannot rotate unknown session")
+            old_csrf = old.csrf_token
             old.rotated = True
             del self._sessions[old_id]
             self._tombstone_locked(old_id, old.absolute_expiry,
                                    old.username, "rotated", old.epoch)
+            self._retire_csrf_locked(old_csrf, old.username, "rotated",
+                                     session_id=old_id)
             self._sessions[new.session_id] = _copy_session(new)
+            if new_csrf is not None:
+                # 极端碰撞下新令牌不得覆盖旧墓碑/旧记录
+                if new_csrf.token in self._csrf_tombstones \
+                        or new_csrf.token in self._csrfs:
+                    raise StoreError("csrf token collision")
+                self._csrfs[new_csrf.token] = _copy_csrf(new_csrf)
 
     def invalidate_user_sessions(self, username: str, now: float,
                                  *, cause: str = "invalidated") -> int:
@@ -153,6 +200,8 @@ class InMemoryStore(Store):
                 s.rotated = True
                 self._tombstone_locked(sid, s.absolute_expiry,
                                        s.username, cause, s.epoch)
+                self._retire_csrf_locked(s.csrf_token, s.username, cause,
+                                         session_id=sid)
             return len(ids)
 
     # --- CSRF ---
@@ -171,6 +220,11 @@ class InMemoryStore(Store):
     def delete_csrf(self, token: str) -> None:
         with self._lock:
             self._csrfs.pop(token, None)
+
+    def csrf_tombstone_info(self, token: str) -> dict | None:
+        with self._lock:
+            t = self._csrf_tombstones.get(token)
+            return None if t is None else dict(t)
 
 
 # 存储返回副本，避免调用方绕开锁修改内部状态。

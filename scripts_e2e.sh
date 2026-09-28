@@ -56,10 +56,40 @@ curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
   -H "X-Session-Id: $SID" \
   -d '{"resource":"docs/a","action":"read"}'; echo
 
-echo "== 登出后重放旧标识 => SESSION_REPLAYED =="
-curl -s -X POST "$BASE/auth/logout" \
-  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $CSRF" -H 'Origin: http://local.test'; echo
+echo "== 轮换标识 => 返回新 session_id / csrf_token =="
+ROT=$(curl -s -X POST "$BASE/auth/rotate" \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $CSRF" -H 'Origin: http://local.test')
+echo "$ROT"
+NEW_SID=$(echo "$ROT" | j "['session_id']")
+NEW_CSRF=$(echo "$ROT" | j "['csrf_token']")
+
+echo "== 新标识+新令牌 同源读 => allowed（新令牌立即生效） =="
+curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $NEW_SID" \
+  -d '{"resource":"docs/a","action":"read"}'; echo
+
+echo "== 新标识+旧令牌 => CSRF_REVOKED（区别于伪造 CSRF_INVALID） =="
+curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $NEW_SID" -H "X-CSRF-Token: $CSRF" \
+  -H 'Origin: http://local.test' \
+  -d '{"resource":"docs/a","action":"write"}'; echo
+
+echo "== 新标识+伪造令牌 => CSRF_INVALID =="
+curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $NEW_SID" -H "X-CSRF-Token: $(python3 -c 'print("00"*32)')" \
+  -H 'Origin: http://local.test' \
+  -d '{"resource":"docs/a","action":"write"}'; echo
+
+echo "== 旧标识重放 => SESSION_REPLAYED（区别于从未存在 UNAUTHENTICATED） =="
 curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
   -H "X-Session-Id: $SID" -d '{"resource":"docs/a","action":"read"}'; echo
+
+echo "== 用新令牌登出 => logged_out =="
+curl -s -X POST "$BASE/auth/logout" \
+  -H "X-Session-Id: $NEW_SID" -H "X-CSRF-Token: $NEW_CSRF" \
+  -H 'Origin: http://local.test'; echo
+echo "== 登出后重放新标识 => SESSION_REPLAYED =="
+curl -s -X POST "$BASE/access/resource" -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $NEW_SID" -d '{"resource":"docs/a","action":"read"}'; echo
 
 echo "E2E_DONE"

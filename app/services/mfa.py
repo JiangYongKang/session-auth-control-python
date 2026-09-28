@@ -121,11 +121,12 @@ class MfaService:
             # 成功：消费该步 + 标记会话 + 轮换会话标识（登录态升级后再换一次）
             user.totp_last_step = step
             self.store.put_user(user)
+            # 来源绑定从旧 CSRF 记录继承（旧令牌由轮换原子撤入墓碑）
             origin = "unknown"
-            existing = self.store.get_csrf(principal.csrf_token or "")
-            if existing is not None:
-                origin = existing.origin
-                self.store.delete_csrf(existing.token)
+            if sess.csrf_token:
+                existing = self.store.get_csrf(sess.csrf_token)
+                if existing is not None:
+                    origin = existing.origin
             new_sid, new_csrf = self._promote_session_locked(
                 sess, now, origin=origin)
         self.audit.record(AuditEvent.MFA_VERIFY, user=user.username,
@@ -214,7 +215,11 @@ class MfaService:
     def _promote_session_locked(self, sess: SessionRecord,
                                 now: float, origin: str = "unknown"
                                 ) -> tuple[str, str]:
-        """MFA 验证成功后：会话升级 + 标识轮换 + 新 CSRF 落库。"""
+        """MFA 验证成功后：会话升级 + 标识轮换 + 新 CSRF 落库。
+
+        旧标识与旧 CSRF 由 store.rotate_session 在同一把锁内撤入墓碑，
+        新标识与新 CSRF 同事务生效。
+        """
         from app.security.csrf import issue_csrf_token
         from app.services.auth import new_session_id
         new_id = new_session_id()
@@ -225,11 +230,12 @@ class MfaService:
             absolute_expiry=sess.absolute_expiry,
             idle_expiry=now + self.config.session.idle_timeout_seconds,
             mfa_verified=True, epoch=sess.epoch, csrf_token=csrf)
-        self.store.rotate_session(sess.session_id, promoted, now)
-        self.store.put_csrf(CsrfTokenRecord(
-            token=csrf, session_id=new_id, username=sess.username,
-            origin=origin,
-            expires_at=now + self.config.session.csrf_ttl_seconds))
+        self.store.rotate_session(
+            sess.session_id, promoted, now,
+            new_csrf=CsrfTokenRecord(
+                token=csrf, session_id=new_id, username=sess.username,
+                origin=origin,
+                expires_at=now + self.config.session.csrf_ttl_seconds))
         return new_id, csrf
 
     def _require_not_enrolled(self, user) -> None:

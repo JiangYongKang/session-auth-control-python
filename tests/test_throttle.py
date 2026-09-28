@@ -73,23 +73,26 @@ def test_concurrent_failures_lock_once(api, store, audit, config):
     assert ErrorCode.INVALID_CREDENTIALS.value in reasons
 
 
-def test_concurrent_failures_never_bypass_to_success(api, store):
+def test_concurrent_failures_never_bypass_to_success(api, store, config):
     api.register("bob")
+    # 先串行把账号打到锁定（确定性前置，不依赖线程调度）
+    for _ in range(config.throttle.max_failures):
+        api.login("bob", "wrongpass1")
+    assert store.get_user("bob").locked_until is not None
 
-    def one(args):
-        pw = args
+    def one(_):
         r = api.c.post("/auth/login",
-                       json={"username": "bob", "password": pw},
+                       json={"username": "bob", "password": "Sup3rSecret"},
                        headers={"Origin": "http://testserver"})
         return r.status_code
 
+    # 锁定期内并发提交正确口令：任何 200 都是绕过，必须全部 423
     with cf.ThreadPoolExecutor(10) as ex:
-        codes = list(ex.map(one, ["wrongpass1"] * 5 + ["Sup3rSecret"] * 5))
-    # 任何 200 都是绕过；先到的正确口令最多产生一次 200（在失败计数前），
-    # 但混合并发下若失败先到则全部 4xx。关键：锁定一旦设置，后续必 423。
-    later = api.login("bob", "Sup3rSecret")
-    # 五错 + 若干对：阈值 3，必然已锁
-    assert later.status_code == 423
+        codes = list(ex.map(one, range(10)))
+    assert codes and all(c == 423 for c in codes), codes
+
+    # 锁定期结束前再次确认仍被锁
+    assert api.login("bob", "Sup3rSecret").status_code == 423
 
 
 def test_thresholds_configurable(store, time_source, audit):
