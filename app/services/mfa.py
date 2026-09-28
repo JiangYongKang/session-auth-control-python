@@ -125,7 +125,9 @@ class MfaService:
             existing = self.store.get_csrf(principal.csrf_token or "")
             if existing is not None:
                 origin = existing.origin
-                self.store.delete_csrf(existing.token)
+                # 旧令牌随标识轮换一起撤销并入 CSRF 墓碑，
+                # 重放判 CSRF_REVOKED，与伪造令牌（CSRF_INVALID）可区分。
+                self.store.revoke_csrf(existing.token)
             new_sid, new_csrf = self._promote_session_locked(
                 sess, now, origin=origin)
         self.audit.record(AuditEvent.MFA_VERIFY, user=user.username,

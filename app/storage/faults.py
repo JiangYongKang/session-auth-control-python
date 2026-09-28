@@ -68,9 +68,11 @@ class FailingStore(Store):
         self._maybe_fail("rotate_session")
         self._inner.rotate_session(old_id, new, now)
 
-    def invalidate_user_sessions(self, username: str, now: float) -> int:
+    def invalidate_user_sessions(self, username: str, now: float,
+                                 *, cause: str = "invalidated") -> int:
         self._maybe_fail("invalidate_user_sessions")
-        return self._inner.invalidate_user_sessions(username, now)
+        return self._inner.invalidate_user_sessions(
+            username, now, cause=cause)
 
     def get_csrf(self, token: str) -> CsrfTokenRecord | None:
         self._maybe_fail("get_csrf")
@@ -83,3 +85,11 @@ class FailingStore(Store):
     def delete_csrf(self, token: str) -> None:
         self._maybe_fail("delete_csrf")
         self._inner.delete_csrf(token)
+
+    def revoke_csrf(self, token: str) -> None:
+        self._maybe_fail("revoke_csrf")
+        self._inner.revoke_csrf(token)
+
+    def get_revoked_csrf(self, token: str) -> CsrfTokenRecord | None:
+        self._maybe_fail("get_revoked_csrf")
+        return self._inner.get_revoked_csrf(token)

@@ -28,6 +28,7 @@ app.audit: AUDIT {"event": "CSRF_REJECTED", "fields": {"origin": "http://evil.ex
 | --- | --- |
 | `tests/test_auth_login.py` | 不可逆口令、用户不存在/口令错误不可区分、审计区分原因 |
 | `tests/test_session_lifecycle.py` | 会话固定、标识轮换、登出/过期重放、登录态失效 |
+| `tests/test_session_rotation.py` | 轮换后新令牌立即完成状态变更、旧令牌 CSRF_REVOKED 与伪造可区分（超 TTL 仍稳定）、旧标识 SESSION_REPLAYED、轮换只作用本条会话、引用跨账号隔离、轮换×淘汰×定向收回并发无半更新 |
 | `tests/test_throttle.py` | 失败阈值、锁定提示、窗口重置、并发锁定一次、阈值可配 |
 | `tests/test_csrf.py` | CSRF 缺失/伪造/过期/跨会话/跨来源绕过、表单与 JSON 一致 |
 | `tests/test_access_control.py` | 默认拒绝、越权、前缀边界、不信客户端角色、MFA 待确认拦截 |
@@ -65,7 +66,9 @@ curl -s http://127.0.0.1:8000/health
 
 脚本会在 8131 端口启动 uvicorn，用 curl 依次验证：
 注册/登录、不可区分失败、越权、CSRF 跨来源/缺失、
-正常放行、登出后旧标识重放。期望最后输出 `E2E_DONE`。
+正常放行、显式轮换（新令牌放行、旧令牌 `CSRF_REVOKED`、伪造
+`CSRF_INVALID`、旧标识 `SESSION_REPLAYED`）、登出后旧标识重放。
+期望最后输出 `E2E_DONE`。
 
 ## 4. 手工复现关键场景
 
@@ -100,6 +103,55 @@ curl -s -X POST $BASE/access/resource -H 'Content-Type: application/json' \
   -H "X-Session-Id: $SID" -d '{"resource":"docs/a","action":"read"}'
 # => {"reason":"SESSION_REPLAYED", ...}
 ```
+
+### 4.1 轮换后新令牌立即可用、旧令牌可区分失效
+
+以下用 editor 账号演示（write 需要 editor 权限；viewer 上也可用
+登出 / 改密 / 定向收回验证同一结论）：
+
+```bash
+BASE=http://127.0.0.1:8000
+curl -s -X POST $BASE/auth/register -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"Sup3rSecret","roles":["editor"]}'
+L=$(curl -s -X POST $BASE/auth/login -H 'Content-Type: application/json' \
+  -H 'Origin: http://local.test' \
+  -d '{"username":"alice","password":"Sup3rSecret"}')
+OLD_SID=$(python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])" <<<"$L")
+OLD_CSRF=$(python3 -c "import sys,json;print(json.load(sys.stdin)['csrf_token'])" <<<"$L")
+
+# 轮换（旧令牌授权本次轮换）
+R=$(curl -s -X POST $BASE/auth/rotate -H "X-Session-Id: $OLD_SID" \
+  -H "X-CSRF-Token: $OLD_CSRF" -H 'Origin: http://local.test')
+SID=$(python3 -c "import sys,json;print(json.load(sys.stdin)['session_id'])" <<<"$R")
+CSRF=$(python3 -c "import sys,json;print(json.load(sys.stdin)['csrf_token'])" <<<"$R")
+
+# 1) 新令牌同源状态变更：立即 200（写资源、登出、改密、定向收回同理）
+curl -s -X POST $BASE/access/resource -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $CSRF" -H 'Origin: http://local.test' \
+  -d '{"resource":"docs/a","action":"write"}'
+# => {"status":"allowed", ...}
+
+# 2) 新标识 + 旧令牌：CSRF_REVOKED（曾签发、已随轮换撤销）
+curl -s -X POST $BASE/access/resource -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $OLD_CSRF" -H 'Origin: http://local.test' \
+  -d '{"resource":"docs/a","action":"write"}'
+# => {"reason":"CSRF_REVOKED", ...}
+
+# 3) 新标识 + 伪造令牌：CSRF_INVALID（从未签发，与 2 可区分）
+curl -s -X POST $BASE/access/resource -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $SID" -H "X-CSRF-Token: $(python3 -c 'print("00"*32)')" \
+  -H 'Origin: http://local.test' -d '{"resource":"docs/a","action":"write"}'
+# => {"reason":"CSRF_INVALID", ...}
+
+# 4) 旧标识重放：SESSION_REPLAYED（与从未存在的 UNAUTHENTICATED 可区分）
+curl -s -X POST $BASE/access/resource -H 'Content-Type: application/json' \
+  -H "X-Session-Id: $OLD_SID" -d '{"resource":"docs/a","action":"read"}'
+# => {"reason":"SESSION_REPLAYED", ...}
+```
+
+并发交错（轮换 × 并发登录的容量淘汰 × 并发定向收回）无需手工复现，
+直接运行 `tests/test_session_rotation.py` 中的并发用例，
+或连续多轮 `uv run pytest` 观察稳定通过。
 
 ## 5. 多因素手工流程
 
@@ -157,6 +209,6 @@ curl -s -X POST $BASE/account/sessions/$REF/revoke \
   `SESSION_ALREADY_REVOKED`、`NOT_FOUND`（会话引用不存在，404）
 - MFA：`MFA_CODE_INVALID`、`MFA_CODE_REUSED`、`MFA_TIME_DRIFT`、
   `MFA_NOT_ENROLLED`、`MFA_ALREADY_ENROLLED`
-- 授权 / CSRF：`FORBIDDEN`、`CSRF_MISSING/INVALID/EXPIRED/BOUND_SESSION/BOUND_ORIGIN`
+- 授权 / CSRF：`FORBIDDEN`、`CSRF_MISSING/INVALID/REVOKED/EXPIRED/BOUND_SESSION/BOUND_ORIGIN`
 - 基础设施：`STORE_UNAVAILABLE`、`TIME_SOURCE_UNAVAILABLE`、
   `CONFIG_ERROR`、`INTERNAL_ERROR`

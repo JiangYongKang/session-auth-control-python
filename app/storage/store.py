@@ -45,6 +45,8 @@ class Store:
     def get_csrf(self, token: str) -> CsrfTokenRecord | None: ...
     def put_csrf(self, token: CsrfTokenRecord) -> None: ...
     def delete_csrf(self, token: str) -> None: ...
+    def revoke_csrf(self, token: str) -> None: ...
+    def get_revoked_csrf(self, token: str) -> CsrfTokenRecord | None: ...
 
 
 class InMemoryStore(Store):
@@ -56,6 +58,10 @@ class InMemoryStore(Store):
         # sid -> {"keep_until": float, "username": str, "cause": str}
         self._tombstones: dict[str, dict] = {}
         self._csrfs: dict[str, CsrfTokenRecord] = {}
+        # 已撤销 CSRF（轮换 / 升级）令牌的墓碑：令牌 -> 撤销前的绑定记录。
+        # 用于把"曾签发但已撤销"与"从未签发（伪造）"稳定区分；
+        # 与会话墓碑一致，在进程生命周期内保留，不做过期清理。
+        self._revoked_csrf: dict[str, CsrfTokenRecord] = {}
         self._lock = threading.RLock()
 
     @contextmanager
@@ -171,6 +177,22 @@ class InMemoryStore(Store):
     def delete_csrf(self, token: str) -> None:
         with self._lock:
             self._csrfs.pop(token, None)
+
+    def revoke_csrf(self, token: str) -> None:
+        """撤销一个活动 CSRF 令牌：从活动集移除并写入 CSRF 墓碑。
+
+        必须在事务（单锁）内与对应会话的轮换/失效一起调用，
+        保证"旧令牌仍可用"与"新令牌尚不可用"两种半状态都不可见。
+        """
+        with self._lock:
+            rec = self._csrfs.pop(token, None)
+            if rec is not None:
+                self._revoked_csrf[token] = _copy_csrf(rec)
+
+    def get_revoked_csrf(self, token: str) -> CsrfTokenRecord | None:
+        with self._lock:
+            t = self._revoked_csrf.get(token)
+            return None if t is None else _copy_csrf(t)
 
 
 # 存储返回副本，避免调用方绕开锁修改内部状态。

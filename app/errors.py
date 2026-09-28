@@ -34,6 +34,7 @@ class ErrorCode(str, Enum):
     # CSRF
     CSRF_MISSING = "CSRF_MISSING"
     CSRF_INVALID = "CSRF_INVALID"
+    CSRF_REVOKED = "CSRF_REVOKED"            # 令牌曾签发，但所属标识已轮换/撤销
     CSRF_EXPIRED = "CSRF_EXPIRED"
     CSRF_BOUND_SESSION = "CSRF_BOUND_SESSION"
     CSRF_BOUND_ORIGIN = "CSRF_BOUND_ORIGIN"
@@ -70,6 +71,7 @@ _STATUS: dict[ErrorCode, int] = {
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.CSRF_MISSING: 403,
     ErrorCode.CSRF_INVALID: 403,
+    ErrorCode.CSRF_REVOKED: 403,
     ErrorCode.CSRF_EXPIRED: 403,
     ErrorCode.CSRF_BOUND_SESSION: 403,
     ErrorCode.CSRF_BOUND_ORIGIN: 403,

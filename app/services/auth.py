@@ -383,7 +383,15 @@ class AuthService:
                 csrf_token=sess.csrf_token)
 
     def rotate_session(self, old_session_id: str) -> tuple[str, str]:
-        """显式轮换标识：旧的入墓碑，新的继承状态（防会话固定）。"""
+        """显式轮换标识：旧的入墓碑，新的继承状态（防会话固定）。
+
+        CSRF 与标识在**同一事务**内一起轮换，由存储单锁串行化，
+        既不会出现"新令牌已返回却不可用"，也不会出现"标识已换而旧令牌
+        仍可用"：
+        - 新令牌立即落库，绑定新标识与原来源，响应返回后立即可用；
+        - 旧令牌立即撤销并进入 CSRF 墓碑，重放判 CSRF_REVOKED，
+          与从未签发过的伪造令牌（CSRF_INVALID）可区分。
+        """
         now = self._now()
         with self.store.transaction():
             old = self.store.get_session(old_session_id)
@@ -397,6 +405,13 @@ class AuthService:
                 self.store.delete_session(old_session_id, cause="invalidated")
                 raise AppError(ErrorCode.SESSION_INVALIDATED,
                                "session invalidated by account change")
+            # 新令牌继承原令牌的来源绑定，保证同源客户端拿到后立即可用。
+            origin = "unknown"
+            old_csrf = old.csrf_token
+            if old_csrf:
+                prior = self.store.get_csrf(old_csrf)
+                if prior is not None:
+                    origin = prior.origin
             new_id = new_session_id()
             csrf = issue_csrf_token()
             new = SessionRecord(
@@ -406,7 +421,14 @@ class AuthService:
                 idle_expiry=now + self.config.session.idle_timeout_seconds,
                 mfa_verified=old.mfa_verified, epoch=old.epoch,
                 csrf_token=csrf)
+            # 顺序无关可见性：三步均在单锁事务内，对外要么全部可见、要么都不可见。
             self.store.rotate_session(old_session_id, new, now)
+            if old_csrf:
+                self.store.revoke_csrf(old_csrf)
+            self.store.put_csrf(CsrfTokenRecord(
+                token=csrf, session_id=new_id, username=old.username,
+                origin=origin,
+                expires_at=now + self.config.session.csrf_ttl_seconds))
         return new_id, csrf
 
     # ------------------------------------------------------------------ #

@@ -2,7 +2,8 @@
 
 CSRF 校验对以下情形给出可区分判定：
 - CSRF_MISSING        未提交令牌
-- CSRF_INVALID        令牌服务端不存在（伪造）
+- CSRF_INVALID        令牌服务端从未签发（伪造）
+- CSRF_REVOKED        令牌曾签发，但所属会话标识已轮换/升级（旧令牌）
 - CSRF_EXPIRED        令牌超过 TTL
 - CSRF_BOUND_SESSION  令牌属于其他会话
 - CSRF_BOUND_ORIGIN   令牌来源与请求 Origin 不一致
@@ -81,6 +82,17 @@ def require_csrf(request: Request, principal: Principal) -> None:
     now = svc.time.now()
     record = svc.store.get_csrf(presented)
     if record is None:
+        # 活动令牌中不存在：进一步区分"曾签发但已撤销（轮换/升级的旧令牌）"
+        # 与"从未签发（伪造）"。前者稳定判 CSRF_REVOKED；墓碑在进程内长期
+        # 保留，因此即使超过 TTL 重放也仍按已撤销判定。
+        revoked = svc.store.get_revoked_csrf(presented)
+        if revoked is not None:
+            svc.audit.record(AuditEvent.CSRF_REJECTED,
+                             user=principal.username, result="denied",
+                             reason=ErrorCode.CSRF_REVOKED.value,
+                             token_owner="rotated_session")
+            raise AppError(ErrorCode.CSRF_REVOKED,
+                           "csrf token revoked by session rotation")
         svc.audit.record(AuditEvent.CSRF_REJECTED, user=principal.username,
                          result="denied",
                          reason=ErrorCode.CSRF_INVALID.value)
